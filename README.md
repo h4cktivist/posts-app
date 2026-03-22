@@ -40,7 +40,7 @@ docker compose run --rm --no-deps app python -m pytest tests
 
 ## Архитектура
 
-
+<img width="1180" height="500" alt="Untitled Diagram drawio (19)" src="https://github.com/user-attachments/assets/9595077e-86fe-4474-9cb1-9037c93aad50" />
 
 ## Кеширование
 
