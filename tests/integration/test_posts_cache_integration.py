@@ -1,12 +1,12 @@
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db.models import Post
 from app.db.session import Base
 from app.repositories.posts_cache_repository import PostsCacheRepository
 from app.repositories.posts_repository import PostsRepository
-from app.schemas.post import PostCreate
+from app.schemas.post import PostCreate, PostResponse
 from app.services.posts_service import PostsService
 
 
@@ -27,67 +27,83 @@ class InMemoryAsyncRedis:
         self.ttl_by_key.pop(key, None)
 
 
-@pytest.fixture
-def db_session():
-    engine = create_engine("sqlite:///:memory:")
-    TestingSessionLocal = sessionmaker(bind=engine)
-    Base.metadata.create_all(bind=engine)
-
-    db: Session = TestingSessionLocal()
+@pytest_asyncio.fixture
+async def db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    session = factory()
     try:
-        yield db
+        yield session
     finally:
-        db.close()
-        Base.metadata.drop_all(bind=engine)
+        await session.close()
+        await engine.dispose()
 
 
-@pytest.fixture
-def service(db_session: Session):
+@pytest_asyncio.fixture
+async def service(db_session: AsyncSession):
     redis = InMemoryAsyncRedis()
     cache_repo = PostsCacheRepository(redis=redis, ttl=60)
     db_repo = PostsRepository(db_session)
     return PostsService(db_repo=db_repo, cache_repo=cache_repo)
 
 
-def _create_post(db_session: Session, title: str = "title", content: str = "content") -> Post:
+async def _create_post(
+    db_session: AsyncSession, title: str = "title", content: str = "content"
+) -> Post:
     post = Post(title=title, content=content)
     db_session.add(post)
-    db_session.commit()
-    db_session.refresh(post)
+    await db_session.commit()
+    await db_session.refresh(post)
     return post
 
 
 @pytest.mark.anyio
-async def test_get_post_uses_cache_after_first_db_read(service: PostsService, db_session: Session):
-    post = _create_post(db_session, title="first", content="from-db")
+async def test_get_post_uses_cache_after_first_db_read(
+    service: PostsService, db_session: AsyncSession
+):
+    post = await _create_post(db_session, title="first", content="from-db")
 
     first_read = await service.get_post(post.id)
-    assert first_read == {"id": post.id, "title": "first", "content": "from-db"}
+    assert first_read == PostResponse(
+        id=post.id, title="first", content="from-db"
+    )
 
-    db_session.delete(post)
-    db_session.commit()
+    await db_session.delete(post)
+    await db_session.commit()
 
     second_read = await service.get_post(post.id)
-    assert second_read == {"id": post.id, "title": "first", "content": "from-db"}
+    assert second_read == PostResponse(
+        id=post.id, title="first", content="from-db"
+    )
 
 
 @pytest.mark.anyio
-async def test_update_post_invalidates_cache(service: PostsService, db_session: Session):
-    post = _create_post(db_session, title="old-title", content="old-content")
+async def test_update_post_invalidates_cache(
+    service: PostsService, db_session: AsyncSession
+):
+    post = await _create_post(db_session, title="old-title", content="old-content")
     await service.get_post(post.id)
 
-    await service.update_post(post.id, PostCreate(title="new-title", content="new-content"))
+    await service.update_post(
+        post.id, PostCreate(title="new-title", content="new-content")
+    )
 
     cached_after_update = await service.cache_repo.get(post.id)
     assert cached_after_update is None
 
     refreshed = await service.get_post(post.id)
-    assert refreshed == {"id": post.id, "title": "new-title", "content": "new-content"}
+    assert refreshed == PostResponse(
+        id=post.id, title="new-title", content="new-content"
+    )
 
 
 @pytest.mark.anyio
-async def test_delete_post_invalidates_cache(service: PostsService, db_session: Session):
-    post = _create_post(db_session, title="to-delete", content="to-delete")
+async def test_delete_post_invalidates_cache(
+    service: PostsService, db_session: AsyncSession
+):
+    post = await _create_post(db_session, title="to-delete", content="to-delete")
     await service.get_post(post.id)
 
     await service.delete_post(post.id)
